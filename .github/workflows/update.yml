@@ -1,0 +1,43 @@
+name: Auto Update Proxies
+
+on:
+  schedule:
+    # Runs every 6 hours (adjust as needed)
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to commit back changes to the repo
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Install Xray Core
+        run: |
+          sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+          xray version
+
+      - name: Run Script
+        run: |
+          # Replace 'ostium.py' with your actual script filename if different
+          python ostium.py --once
+
+      - name: Commit and Push Results
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 Auto-update proxy lists [skip ci]"
+          file_pattern: "archive_all/* logs/*"
