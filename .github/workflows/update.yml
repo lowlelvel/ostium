@@ -1,7 +1,7 @@
 name: Auto Update Proxies
 
 on:
-  # Runs every 6 hours. Scheduled runs save error logs by default.
+  # Runs every 6 hours. Scheduled runs do not retain error logs by default.
   schedule:
     - cron: '0 */6 * * *'
 
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-    # Scheduled runs always save logs. Manual runs follow the checkbox above.
+    # Manual runs follow the checkbox. Scheduled runs leave error-log retention OFF.
     env:
       SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs }}
 
@@ -129,7 +129,6 @@ jobs:
         shell: bash
         run: |
           mkdir -p archive_all
-          mkdir -p logs
           set -Eeuo pipefail
           # Make sure 'script.py' matches your actual Python script filename.
           "$PYTHON_BIN" script.py --once
@@ -145,6 +144,7 @@ jobs:
           retention-days: 14
 
       # Error logs are uploaded only when the toggle is ON.
+      # Oversized files are still included here; the size limit below applies only to Git commits.
       - name: Upload Error Logs
         if: always() && env.SAVE_ERROR_LOGS == 'true'
         uses: actions/upload-artifact@v4
@@ -162,7 +162,11 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Archive updates are always saved to the repository.
+          # GitHub rejects individual Git files at 100 MB. Use a conservative
+          # 90 MiB threshold so generated files cannot hit that hard limit.
+          MAX_GIT_FILE_SIZE_BYTES=$((90 * 1024 * 1024))
+
+          # Archive updates are always saved to the repository, subject to the file-size cap.
           if [[ -d "archive_all" ]]; then
             git add -A -- archive_all/
           fi
@@ -177,9 +181,25 @@ jobs:
             echo "Error-log saving is OFF. Logs will not be committed or uploaded."
           fi
 
+          # Unstage any oversized generated file. It remains on disk and, when
+          # enabled, is still available in the Actions artifact uploaded above.
+          skipped_large_files=0
+          while IFS= read -r -d '' staged_file; do
+            if [[ -f "$staged_file" ]]; then
+              file_size="$(stat -c '%s' -- "$staged_file")"
+              if (( file_size > MAX_GIT_FILE_SIZE_BYTES )); then
+                echo "::warning file=${staged_file}::Skipping Git commit: file is ${file_size} bytes (limit ${MAX_GIT_FILE_SIZE_BYTES}). It remains available in the workflow artifact."
+                git restore --staged -- "$staged_file"
+                skipped_large_files=$((skipped_large_files + 1))
+              fi
+            fi
+          done < <(git diff --cached --name-only -z -- archive_all/ logs/)
+
+          echo "Skipped ${skipped_large_files} oversized file(s) from Git staging."
+
           # Commit and push only when there are staged changes.
           if git diff --cached --quiet; then
-            echo "No archive or log changes to commit."
+            echo "No archive or log changes under the Git file-size limit to commit."
           else
             git commit -m "🤖 Auto-update proxy lists and optional error logs [skip ci]"
             git push
