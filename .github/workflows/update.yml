@@ -32,71 +32,58 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # Query GitHub for the latest stable release and its exact asset URL.
-          # This avoids depending on a stale hard-coded /releases/latest/download URL.
-          release_json="$(mktemp)"
-          download_dir="$(mktemp -d)"
-          trap 'rm -f "$release_json"; rm -rf "$download_dir"' EXIT
+          # Use XTLS's official GHCR image instead of downloading the release ZIP.
+          # This bypasses the GitHub Releases asset/CDN endpoint that returned 504.
+          image="ghcr.io/xtls/xray-core:latest"
+          work_dir="$(mktemp -d)"
+          container_id=""
+          cleanup() {
+            if [[ -n "$container_id" ]]; then
+              docker rm -f "$container_id" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$work_dir"
+          }
+          trap cleanup EXIT
 
-          release_api="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-          curl --fail --silent --show-error --location \
-            --retry 5 --retry-delay 2 --retry-all-errors \
-            --connect-timeout 20 \
-            "$release_api" \
-            --output "$release_json"
+          command -v docker >/dev/null
 
-          asset_url="$(jq -er \
-            '[.assets[] | select(.name == "Xray-linux-64.zip")][0].browser_download_url // empty' \
-            "$release_json")"
+          # Retry transient GHCR/network failures with increasing delays.
+          pulled=false
+          for attempt in 1 2 3 4 5; do
+            if docker pull --platform linux/amd64 "$image"; then
+              pulled=true
+              break
+            fi
 
-          asset_digest="$(jq -r \
-            '[.assets[] | select(.name == "Xray-linux-64.zip")][0].digest // ""' \
-            "$release_json")"
+            if (( attempt < 5 )); then
+              delay=$((attempt * 10))
+              echo "GHCR pull failed (attempt ${attempt}/5); retrying in ${delay}s..."
+              sleep "$delay"
+            fi
+          done
 
-          if [[ -z "$asset_url" ]]; then
-            echo "ERROR: Xray-linux-64.zip was not found in the latest release."
+          if [[ "$pulled" != true ]]; then
+            echo "ERROR: Could not pull the official Xray image: ${image}"
             exit 1
           fi
 
-          echo "Downloading Xray asset: $asset_url"
-          zip_path="$download_dir/xray.zip"
-          curl --fail --silent --show-error --location \
-            --retry 5 --retry-delay 2 --retry-all-errors \
-            --connect-timeout 20 \
-            "$asset_url" \
-            --output "$zip_path"
+          # Create (but do not start) a container and copy the binary out. The
+          # official image is minimal and does not need to contain a shell.
+          container_id="$(docker create --platform linux/amd64 "$image")"
+          docker cp "${container_id}:/usr/local/bin/xray" "$work_dir/xray"
+          docker rm "$container_id" >/dev/null
+          container_id=""
 
-          # Reject empty, unexpectedly small, or invalid downloads before extraction.
-          if [[ ! -s "$zip_path" ]]; then
-            echo "ERROR: Xray download is empty."
+          chmod 0755 "$work_dir/xray"
+          version_output="$("$work_dir/xray" version 2>&1)"
+          printf '%s\n' "$version_output"
+
+          if ! grep --extended-regexp --quiet '^Xray [0-9]' <<<"$version_output"; then
+            echo "ERROR: The binary copied from the official image did not report a valid Xray version."
             exit 1
           fi
 
-          archive_size="$(stat -c '%s' "$zip_path")"
-          if (( archive_size < 1000000 )); then
-            echo "ERROR: Xray download is only ${archive_size} bytes; expected a release archive."
-            exit 1
-          fi
-
-          unzip -tq "$zip_path" >/dev/null
-
-          # Verify against GitHub's published asset digest when it is provided.
-          if [[ "$asset_digest" == sha256:* ]]; then
-            expected_sha256="${asset_digest#sha256:}"
-            printf '%s  %s\n' "$expected_sha256" "$zip_path" | sha256sum --check -
-          fi
-
-          extract_dir="$download_dir/extracted"
-          mkdir -p "$extract_dir"
-          unzip -oq "$zip_path" -d "$extract_dir"
-
-          xray_binary="$(find "$extract_dir" -type f -name xray -print -quit)"
-          if [[ -z "$xray_binary" ]]; then
-            echo "ERROR: The downloaded archive does not contain an xray binary."
-            exit 1
-          fi
-
-          sudo install -m 0755 "$xray_binary" /usr/local/bin/xray
+          sudo install -m 0755 "$work_dir/xray" /usr/local/bin/xray
           xray version
 
       - name: Run Script
@@ -126,4 +113,8 @@ jobs:
 
           # Commit and push only when there are staged changes.
           if git diff --cached --quiet; then
-
+            echo "No archive or log changes to commit."
+          else
+            git commit -m "🤖 Auto-update proxy lists and logs [skip ci]"
+            git push
+          fi
