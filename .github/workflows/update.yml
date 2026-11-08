@@ -39,12 +39,22 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Avoid unnecessary pip upgrades/downloads. Install only requests
-          # when it is not already available on the hosted runner.
-          if ! "$PYTHON_BIN" -c 'import requests' >/dev/null 2>&1; then
-            "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input requests PySocks
+
+          # Requests needs the optional PySocks package for socks5h:// proxies.
+          # Check BOTH imports: requests may already exist while SOCKS support
+          # is missing, which caused the original runtime failure.
+          if ! "$PYTHON_BIN" -c 'import requests, socks' >/dev/null 2>&1; then
+            "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input 'requests[socks]'
           fi
-          "$PYTHON_BIN" -c 'import requests; print("requests", requests.__version__)'
+
+          # Fail here with a clear message if the optional SOCKS dependency
+          # was not made available to the same Python interpreter as the script.
+          "$PYTHON_BIN" - <<'PYTHON_CHECK'
+          import requests
+          import socks
+          print("requests", requests.__version__)
+          print("PySocks", getattr(socks, "__version__", "installed"))
+          PYTHON_CHECK
 
       - name: Install Xray Core
         shell: bash
@@ -111,6 +121,19 @@ jobs:
           set -Eeuo pipefail
           # Make sure 'script.py' matches your actual Python script filename.
           "$PYTHON_BIN" script.py --once
+
+      # Upload output files even if the script exits with an error, so any
+      # archives/logs produced before the failure remain available for diagnosis.
+      - name: Upload Results and Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-results-${{ github.run_number }}
+          path: |
+            archive_all/
+            logs/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Commit and Push Results
         shell: bash
