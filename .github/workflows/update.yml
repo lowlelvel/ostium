@@ -42,7 +42,7 @@ jobs:
           # Avoid unnecessary pip upgrades/downloads. Install only requests
           # when it is not already available on the hosted runner.
           if ! "$PYTHON_BIN" -c 'import requests' >/dev/null 2>&1; then
-            "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input requests
+            "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input requests PySocks
           fi
           "$PYTHON_BIN" -c 'import requests; print("requests", requests.__version__)'
 
