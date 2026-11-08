@@ -46,7 +46,17 @@ jobs:
           python script.py --once
 
       - name: Commit and Push Results
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "🤖 Auto-update proxy lists [skip ci]"
-          file_pattern: "archive_all/*"
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Always stage archive updates
+          git add archive_all/
+          
+          # Conditionally stage logs if the directory exists and has files
+          if [ -d "logs" ] && [ "$(ls -A logs)" ]; then
+            git add logs/
+          fi
+          
+          # Commit and push only if there are staged changes
+          git diff --cached --quiet || (git commit -m "🤖 Auto-update proxy lists and logs [skip ci]" && git push)
