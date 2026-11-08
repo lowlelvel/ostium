@@ -1,35 +1,3 @@
-name: Auto Update Proxies
-
-on:
-  # Runs every 6 hours.
-  schedule:
-    - cron: '0 */6 * * *'
-  # Allows manual trigger from the Actions tab.
-  workflow_dispatch:
-
-jobs:
-  update:
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      # ubuntu-22.04 includes system Python 3.10. Use it directly instead
-      # of actions/setup-python, which downloads Python from GitHub Releases
-      # and can fail when that asset endpoint returns HTTP 504.
-      - name: Verify Runner Python
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          PYTHON_BIN="$(command -v python3)"
-          "$PYTHON_BIN" - <<'PYTHON_CHECK'
-          import sys
-          if sys.version_info[:2] != (3, 10):
-              raise SystemExit(
-                  f"Expected Python 3.10 on ubuntu-22.04, found {sys.version.split()[0]}"
               )
           print(f"Using runner Python {sys.version.split()[0]}")
           PYTHON_CHECK
@@ -94,4 +62,47 @@ jobs:
           container_id=""
 
           chmod 0755 "$work_dir/xray"
+          version_output="$("$work_dir/xray" version 2>&1)"
+          printf '%s\n' "$version_output"
+
+          if ! grep --extended-regexp --quiet '^Xray [0-9]' <<<"$version_output"; then
+            echo "ERROR: The binary copied from the official image did not report a valid Xray version."
+            exit 1
+          fi
+
+          sudo install -m 0755 "$work_dir/xray" /usr/local/bin/xray
+          xray version
+
+      - name: Run Script
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Make sure 'script.py' matches your actual Python script filename.
+          "$PYTHON_BIN" script.py --once
+
+      - name: Commit and Push Results
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage archive updates when the directory exists.
+          if [[ -d "archive_all" ]]; then
+            git add -A -- archive_all/
+          fi
+
+          # Stage logs only when the directory contains at least one file.
+          if [[ -d "logs" ]] && [[ -n "$(find logs -type f -print -quit)" ]]; then
+            git add -A -- logs/
+          fi
+
+          # Commit and push only when there are staged changes.
+          if git diff --cached --quiet; then
+            echo "No archive or log changes to commit."
+          else
+            git commit -m "🤖 Auto-update proxy lists and logs [skip ci]"
+            git push
+          fi
 
