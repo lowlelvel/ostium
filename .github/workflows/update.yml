@@ -167,6 +167,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+
       - name: Commit and Push Results
         shell: bash
         run: |
@@ -175,45 +176,61 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
-          # GitHub rejects individual Git files at 100 MB. Use a conservative
-          # 90 MiB threshold so generated files cannot hit that hard limit.
+          # GitHub rejects individual Git files at 100 MB.
           MAX_GIT_FILE_SIZE_BYTES=$((90 * 1024 * 1024))
 
-          # Archive updates are always saved to the repository, subject to the file-size cap.
+          # Always stage proxy archives.
           if [[ -d "archive_all" ]]; then
             git add -A -- archive_all/
           fi
 
+          # Always stage geolocation results.
+          # -f ensures that files are included even if geolocation/
+          # is accidentally listed in .gitignore.
+          if [[ -d "geolocation" ]]; then
+            git add -f -A -- geolocation/
+            echo "Geolocation results staged for repository commit."
+            find geolocation -maxdepth 1 -type f -printf '  %p (%s bytes)\n' || true
+          fi
+
           # Save logs to the repository only when the toggle is ON.
           if [[ "$SAVE_ERROR_LOGS" == "true" ]]; then
-            if [[ -d "logs" ]] && [[ -n "$(find logs -type f -print -quit)" ]]; then
+            if [[ -d "logs" ]]; then
               git add -A -- logs/
             fi
             echo "Error-log saving is ON."
           else
-            echo "Error-log saving is OFF. Logs will not be committed or uploaded."
+            echo "Error-log saving is OFF. Logs will not be committed."
           fi
 
-          # Unstage any oversized generated file. It remains on disk and, when
-          # enabled, is still available in the Actions artifact uploaded above.
+          # Remove oversized files from Git staging.
+          # They remain available through the previously uploaded artifacts.
           skipped_large_files=0
+
           while IFS= read -r -d '' staged_file; do
             if [[ -f "$staged_file" ]]; then
               file_size="$(stat -c '%s' -- "$staged_file")"
+
               if (( file_size > MAX_GIT_FILE_SIZE_BYTES )); then
                 echo "::warning file=${staged_file}::Skipping Git commit: file is ${file_size} bytes (limit ${MAX_GIT_FILE_SIZE_BYTES}). It remains available in the workflow artifact."
+
                 git restore --staged -- "$staged_file"
                 skipped_large_files=$((skipped_large_files + 1))
               fi
             fi
-          done < <(git diff --cached --name-only -z -- archive_all/ logs/)
+          done < <(
+            git diff --cached --name-only -z -- archive_all/ geolocation/ logs/
+          )
 
           echo "Skipped ${skipped_large_files} oversized file(s) from Git staging."
 
+          echo "Files staged for commit:"
+          git diff --cached --name-status
+
           # Commit and push only when there are staged changes.
           if git diff --cached --quiet; then
-            echo "No archive or log changes under the Git file-size limit to commit."
+            echo "No archive, geolocation, or log changes to commit."
           else
-            git commit -m "🤖 Auto-update proxy lists and optional error logs [skip ci]"
-            git push
+            git commit -m "🤖 Auto-update proxy lists and geolocation results [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
