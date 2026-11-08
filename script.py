@@ -600,7 +600,8 @@ def socks_support_available() -> bool:
 # ---------------------------------------------------------------- progress
 def render_progress(done: int, total: int, passed: int, failed: int,
                     skipped: int, gemini_pass: int, reddit_pass: int,
-                    gemini_reddit_pass: int, start: float) -> None:
+                    reddit_attempted: int, gemini_reddit_pass: int,
+                    start: float) -> None:
     pct = done / total if total else 1.0
     bar_w = 30
     filled = int(bar_w * pct)
@@ -611,14 +612,15 @@ def render_progress(done: int, total: int, passed: int, failed: int,
     if not IS_TTY:
         if done % 50 == 0 or done == total:
             print(f"  {done}/{total}  PASS {passed}  GEMINI {gemini_pass}  "
-                  f"REDDIT {reddit_pass}  BOTH {gemini_reddit_pass}  "
+                  f"REDDIT {reddit_pass}/{reddit_attempted}  BOTH {gemini_reddit_pass}  "
                   f"FAIL {failed}  SKIP {skipped}")
         return
 
     line = (
         f"\r  [{bar}] {done}/{total} ({pct * 100:5.1f}%)  "
-        f"PASS {passed}  GEMINI {gemini_pass}  REDDIT {reddit_pass}  "
-        f"BOTH {gemini_reddit_pass}  FAIL {failed}  SKIP {skipped}  "
+        f"PASS {passed}  GEMINI {gemini_pass}  "
+        f"REDDIT {reddit_pass}/{reddit_attempted}  BOTH {gemini_reddit_pass}  "
+        f"FAIL {failed}  SKIP {skipped}  "
         f"ETA {eta:4.0f}s"
     )
     sys.stdout.write(line + "\x1b[K")
@@ -771,6 +773,8 @@ def run_once(use_last_fetch: bool = False) -> None:
     gemini_working: list[str] = []
     gemini_reddit_working: list[str] = []
     detailed_failures: list[tuple[str, dict, str]] = []
+    # Keep per-config site-check outcomes so a zero Reddit pass count is diagnosable.
+    site_check_results: list[tuple[str, str, str]] = []
 
     def record_working(uri: str) -> None:
         working.append(uri)
@@ -790,7 +794,10 @@ def run_once(use_last_fetch: bool = False) -> None:
     failed = 0
     gemini_pass = 0
     reddit_pass = 0
+    reddit_attempted = 0
     reddit_blocked = 0
+    reddit_unreachable = 0
+    reddit_http_errors = 0
     reddit_other_fail = 0
     gemini_reddit_pass = 0
     start = time.time()
@@ -806,6 +813,10 @@ def run_once(use_last_fetch: bool = False) -> None:
                 if works:
                     record_working(uri)
                     passed += 1
+                    # Reddit is checked independently for every config that passes
+                    # the three base connectivity endpoints.
+                    reddit_attempted += 1
+                    site_check_results.append((uri, gemini_status, reddit_status))
                     if gemini_ok:
                         record_gemini(uri)
                         gemini_pass += 1
@@ -813,6 +824,10 @@ def run_once(use_last_fetch: bool = False) -> None:
                         reddit_pass += 1
                     elif reddit_status.startswith("Blocked"):
                         reddit_blocked += 1
+                    elif reddit_status.startswith("Unreachable"):
+                        reddit_unreachable += 1
+                    elif reddit_status.startswith("HTTP "):
+                        reddit_http_errors += 1
                     else:
                         reddit_other_fail += 1
                     if gemini_ok and reddit_ok:
@@ -828,7 +843,8 @@ def run_once(use_last_fetch: bool = False) -> None:
                     sys.stdout.write("\n")
                 log(f"  ERR testing {uri[:70]}: {e}")
             render_progress(done, len(testable), passed, failed, skipped,
-                            gemini_pass, reddit_pass, gemini_reddit_pass, start)
+                            gemini_pass, reddit_pass, reddit_attempted,
+                            gemini_reddit_pass, start)
 
     if IS_TTY:
         sys.stdout.write("\n")
@@ -839,11 +855,23 @@ def run_once(use_last_fetch: bool = False) -> None:
         f"PASS {passed}  FAIL {failed}  SKIP {skipped}  (total {len(unique)})")
     log(f"Gemini-compatible: {gemini_pass}  "
         f"Gemini-blocked/unreachable: {passed - gemini_pass}")
+    log(f"Reddit checks attempted: {reddit_attempted}")
     log(f"Reddit-accessible: {reddit_pass}  "
-        f"Reddit-blocked/unreachable: {passed - reddit_pass}")
-    log(f"Reddit network-security/rate-limit blocks: {reddit_blocked}  "
-        f"Other HTTP errors/unreachable: {reddit_other_fail}")
+        f"Reddit network-security/rate-limit blocks: {reddit_blocked}  "
+        f"Unreachable: {reddit_unreachable}  HTTP errors: {reddit_http_errors}  "
+        f"Other errors: {reddit_other_fail}")
     log(f"Gemini + Reddit compatible: {gemini_reddit_pass}")
+
+    # Save exact per-config outcomes, including request exceptions and HTTP codes.
+    if site_check_results:
+        site_check_log = LOG_DIR / f"{stamp}_gemini_reddit_checks.txt"
+        with site_check_log.open("w", encoding="utf-8", newline="\n") as f:
+            for i, (uri, gemini_status, reddit_status) in enumerate(site_check_results, 1):
+                f.write(f"[{i}] URI: {uri}\n")
+                f.write(f"Gemini: {gemini_status}\n")
+                f.write(f"Reddit: {reddit_status}\n")
+                f.write("-" * 80 + "\n")
+        log(f"Saved per-config Gemini/Reddit diagnostics: {site_check_log}")
     log(f"Saved: {working_txt}  ({len(working)} configs)")
     log(f"Saved: {working_b64}")
     log(f"Saved: {gemini_txt}  ({len(gemini_working)} configs)")
