@@ -37,13 +37,21 @@ TEST_ENDPOINTS = [
 TEST_TIMEOUT = 1
 TEST_WORKERS = 80
 
-# ---- Gemini compatibility check ----
+# ---- Gemini and Reddit compatibility checks ----
 # Only run against configs that already passed all TEST_ENDPOINTS above.
 GEMINI_TEST_URL = "https://gemini.google.com/"
 GEMINI_TIMEOUT = 5
 # The page tells us the country is blocked with this sentence.
 # We normalize apostrophes (curly vs straight) and case before comparing.
 GEMINI_BLOCKED_MARKER = "Gemini isn't currently supported in your country. Stay tuned!"
+
+REDDIT_TEST_URL = "https://www.reddit.com/"
+REDDIT_TIMEOUT = 5
+REDDIT_BLOCKED_MARKERS = (
+    "You've been blocked by network security.",
+    "use your developer token",
+    "If you think you've been blocked by mistake",
+)
 
 CONFIG_RE = re.compile(
     r"(?:vmess|vless|trojan|ssr|ss|hysteria2|hysteria|hy2|tuic|wireguard|wg)://[^\s\"'<>`]+",
@@ -442,16 +450,22 @@ def is_gemini_blocked(body: str) -> bool:
     return _normalize_for_match(GEMINI_BLOCKED_MARKER) in _normalize_for_match(body)
 
 
-def test_one(p: dict) -> tuple[bool, bool, str]:
-    """Return (works, gemini_compatible, failure_reason).
+def is_reddit_blocked(body: str) -> bool:
+    """True when Reddit displays its network-security block message."""
+    normalized = _normalize_for_match(body)
+    return any(_normalize_for_match(marker) in normalized for marker in REDDIT_BLOCKED_MARKERS)
+
+
+def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
+    """Return (works, gemini_ok, reddit_ok, gemini_status, reddit_status).
 
     `works` is the result of the original 3 reachability checks.
-    `gemini_compatible` is only meaningful when `works` is True.
-    `failure_reason` contains verbose diagnostic logs and reason for failure if any.
+    Site compatibility checks run independently after those checks pass.
     """
     outbound = build_outbound(p)
     if not outbound:
-        return (False, False, "Failed to build outbound configuration (invalid or missing address/port).")
+        return (False, False, False,
+                "Failed to build outbound configuration (invalid or missing address/port).", "")
 
     port = free_port()
     cfg = {
@@ -487,7 +501,8 @@ def test_one(p: dict) -> tuple[bool, bool, str]:
                 except Exception:
                     pass
                 logs_str = "".join(xray_output)
-                return (False, False, f"Xray failed to bind/open port {port} within timeout.\nXray Debug Logs:\n{logs_str}")
+                return (False, False, False,
+                        f"Xray failed to bind/open port {port} within timeout.\nXray Debug Logs:\n{logs_str}", "")
 
             proxy_url = f"socks5h://127.0.0.1:{port}"
             proxies = {"http": proxy_url, "https": proxy_url}
@@ -498,7 +513,8 @@ def test_one(p: dict) -> tuple[bool, bool, str]:
                     if r.status_code >= 500:
                         proc.terminate()
                         proc.wait(timeout=2)
-                        return (False, False, f"Test endpoint {url} returned failure status code: {r.status_code}")
+                        return (False, False, False,
+                                f"Test endpoint {url} returned failure status code: {r.status_code}", "")
                 except requests.RequestException as req_err:
                     proc.terminate()
                     proc.wait(timeout=2)
@@ -509,9 +525,13 @@ def test_one(p: dict) -> tuple[bool, bool, str]:
                     except Exception:
                         pass
                     logs_str = "".join(xray_output)
-                    return (False, False, f"Request exception connecting to test endpoint {url}: {req_err}.\nXray Debug Logs:\n{logs_str}")
+                    return (False, False, False,
+                            f"Request exception connecting to test endpoint {url}: {req_err}.\nXray Debug Logs:\n{logs_str}", "")
 
-            # ---- 3 base checks passed. Now the Gemini compatibility check. ----
+            # ---- Base checks passed. Check Gemini and Reddit independently. ----
+            gemini_ok = False
+            reddit_ok = False
+
             try:
                 g = requests.get(
                     GEMINI_TEST_URL,
@@ -519,16 +539,37 @@ def test_one(p: dict) -> tuple[bool, bool, str]:
                     timeout=GEMINI_TIMEOUT,
                     allow_redirects=True,
                 )
+                if g.status_code >= 400:
+                    gemini_status = f"HTTP {g.status_code}"
+                elif is_gemini_blocked(g.text or ""):
+                    gemini_status = "Geo-blocked"
+                else:
+                    gemini_ok = True
+                    gemini_status = "Allowed"
             except requests.RequestException as gemini_err:
-                return (True, False, f"Passed base checks, but Gemini request exception: {gemini_err}")
+                gemini_status = f"Unreachable: {gemini_err}"
 
-            if g.status_code >= 400:
-                return (True, False, f"Passed base checks, but Gemini responded with status code: {g.status_code}")
+            try:
+                r = requests.get(
+                    REDDIT_TEST_URL,
+                    headers=HEADERS,
+                    proxies=proxies,
+                    timeout=REDDIT_TIMEOUT,
+                    allow_redirects=True,
+                )
+                if is_reddit_blocked(r.text or ""):
+                    reddit_status = "Blocked by Reddit network security"
+                elif r.status_code in (403, 429):
+                    reddit_status = f"Blocked/rate-limited (HTTP {r.status_code})"
+                elif r.status_code >= 400:
+                    reddit_status = f"HTTP {r.status_code}"
+                else:
+                    reddit_ok = True
+                    reddit_status = "Allowed"
+            except requests.RequestException as reddit_err:
+                reddit_status = f"Unreachable: {reddit_err}"
 
-            if is_gemini_blocked(g.text or ""):
-                return (True, False, "Passed base checks, but Gemini returned geo-block restriction marker.")
-
-            return (True, True, "Success: Passed all endpoints and Gemini compatibility check.")
+            return (True, gemini_ok, reddit_ok, gemini_status, reddit_status)
         finally:
             proc.terminate()
             try:
@@ -558,7 +599,8 @@ def socks_support_available() -> bool:
 
 # ---------------------------------------------------------------- progress
 def render_progress(done: int, total: int, passed: int, failed: int,
-                    skipped: int, gemini_pass: int, start: float) -> None:
+                    skipped: int, gemini_pass: int, reddit_pass: int,
+                    gemini_reddit_pass: int, start: float) -> None:
     pct = done / total if total else 1.0
     bar_w = 30
     filled = int(bar_w * pct)
@@ -569,12 +611,14 @@ def render_progress(done: int, total: int, passed: int, failed: int,
     if not IS_TTY:
         if done % 50 == 0 or done == total:
             print(f"  {done}/{total}  PASS {passed}  GEMINI {gemini_pass}  "
+                  f"REDDIT {reddit_pass}  BOTH {gemini_reddit_pass}  "
                   f"FAIL {failed}  SKIP {skipped}")
         return
 
     line = (
         f"\r  [{bar}] {done}/{total} ({pct * 100:5.1f}%)  "
-        f"PASS {passed}  GEMINI {gemini_pass}  FAIL {failed}  SKIP {skipped}  "
+        f"PASS {passed}  GEMINI {gemini_pass}  REDDIT {reddit_pass}  "
+        f"BOTH {gemini_reddit_pass}  FAIL {failed}  SKIP {skipped}  "
         f"ETA {eta:4.0f}s"
     )
     sys.stdout.write(line + "\x1b[K")
@@ -702,10 +746,12 @@ def run_once(use_last_fetch: bool = False) -> None:
     working_b64 = ARCHIVE_DIR / f"{stamp}_working_base64.txt"
     gemini_txt = ARCHIVE_DIR / f"{stamp}_gemini_compatible_working.txt"
     gemini_b64 = ARCHIVE_DIR / f"{stamp}_gemini_compatible_working_base64.txt"
+    gemini_reddit_txt = ARCHIVE_DIR / f"{stamp}_gemini_reddit_working.txt"
     working_txt.write_text("", encoding="utf-8")
     working_b64.write_text("", encoding="utf-8")
     gemini_txt.write_text("", encoding="utf-8")
     gemini_b64.write_text("", encoding="utf-8")
+    gemini_reddit_txt.write_text("", encoding="utf-8")
 
     if not socks_support_available():
         log("ERROR: SOCKS proxy support is missing from this Python environment.")
@@ -723,6 +769,7 @@ def run_once(use_last_fetch: bool = False) -> None:
 
     working: list[str] = []
     gemini_working: list[str] = []
+    gemini_reddit_working: list[str] = []
     detailed_failures: list[tuple[str, dict, str]] = []
 
     def record_working(uri: str) -> None:
@@ -735,9 +782,17 @@ def run_once(use_last_fetch: bool = False) -> None:
         _append_line(gemini_txt, uri)
         _write_b64(gemini_b64, gemini_working)
 
+    def record_gemini_reddit(uri: str) -> None:
+        gemini_reddit_working.append(uri)
+        _append_line(gemini_reddit_txt, uri)
+
     passed = 0
     failed = 0
     gemini_pass = 0
+    reddit_pass = 0
+    reddit_blocked = 0
+    reddit_other_fail = 0
+    gemini_reddit_pass = 0
     start = time.time()
 
     with ThreadPoolExecutor(max_workers=TEST_WORKERS) as ex:
@@ -747,23 +802,33 @@ def run_once(use_last_fetch: bool = False) -> None:
             done += 1
             uri, p = futures[fut]
             try:
-                works, gemini_ok, fail_reason = fut.result()
+                works, gemini_ok, reddit_ok, gemini_status, reddit_status = fut.result()
                 if works:
                     record_working(uri)
                     passed += 1
                     if gemini_ok:
                         record_gemini(uri)
                         gemini_pass += 1
+                    if reddit_ok:
+                        reddit_pass += 1
+                    elif reddit_status.startswith("Blocked"):
+                        reddit_blocked += 1
+                    else:
+                        reddit_other_fail += 1
+                    if gemini_ok and reddit_ok:
+                        record_gemini_reddit(uri)
+                        gemini_reddit_pass += 1
                 else:
                     failed += 1
-                    detailed_failures.append((uri, p, fail_reason))
+                    detailed_failures.append((uri, p, gemini_status))
             except Exception as e:
                 failed += 1
                 detailed_failures.append((uri, p, f"Unhandled exception during test execution: {e}"))
                 if IS_TTY:
                     sys.stdout.write("\n")
                 log(f"  ERR testing {uri[:70]}: {e}")
-            render_progress(done, len(testable), passed, failed, skipped, gemini_pass, start)
+            render_progress(done, len(testable), passed, failed, skipped,
+                            gemini_pass, reddit_pass, gemini_reddit_pass, start)
 
     if IS_TTY:
         sys.stdout.write("\n")
@@ -774,10 +839,16 @@ def run_once(use_last_fetch: bool = False) -> None:
         f"PASS {passed}  FAIL {failed}  SKIP {skipped}  (total {len(unique)})")
     log(f"Gemini-compatible: {gemini_pass}  "
         f"Gemini-blocked/unreachable: {passed - gemini_pass}")
+    log(f"Reddit-accessible: {reddit_pass}  "
+        f"Reddit-blocked/unreachable: {passed - reddit_pass}")
+    log(f"Reddit network-security/rate-limit blocks: {reddit_blocked}  "
+        f"Other HTTP errors/unreachable: {reddit_other_fail}")
+    log(f"Gemini + Reddit compatible: {gemini_reddit_pass}")
     log(f"Saved: {working_txt}  ({len(working)} configs)")
     log(f"Saved: {working_b64}")
     log(f"Saved: {gemini_txt}  ({len(gemini_working)} configs)")
     log(f"Saved: {gemini_b64}")
+    log(f"Saved: {gemini_reddit_txt}  ({len(gemini_reddit_working)} configs)")
 
     detailed_log_path = save_detailed_failures_log(detailed_failures)
     if detailed_log_path:
