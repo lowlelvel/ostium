@@ -105,11 +105,20 @@ GEOLOCATION_API_SERVICES = [
     "ip.sb",
 ]
 
+# These HTTPS endpoints report the public IP seen by the remote service.
+# Requests to them are made THROUGH each config's local Xray SOCKS5 tunnel.
+GEOLOCATION_EXIT_IP_URLS = [
+    "https://api64.ipify.org?format=json",
+    "https://checkip.amazonaws.com/",
+    "https://icanhazip.com/",
+]
+GEOLOCATION_EXIT_IP_TIMEOUT = (8, 12)
+
 # Geolocation runs sequentially after the Xray worker pool has finished.
 _GEO_SESSION = requests.Session()
 _GEO_NEXT_REQUEST_TIME = 0.0
 _GEO_API_INDEX = 0
-_GEO_DNS_CACHE: dict[str, str] = {}
+_GEO_EXIT_IP_CACHE: dict[str, str | None] = {}
 _GEO_COUNTRY_CACHE: dict[str, str | None] = {}
 _GEO_API_ERROR_COUNTER: dict[str, int] = {}
 _GEO_DB_READER = None
@@ -857,7 +866,8 @@ def _write_b64(path: Path, uris: list[str]) -> None:
 
 # ---------------------------------------------------------------- geolocation
 # This stage operates only on the result lists produced by the original checks.
-# It does not start Xray again and does not modify the original archive files.
+# It starts Xray again per unique config to identify its actual exit IP, and
+# writes separate files without modifying the original archive files.
 def _geo_wait_rate() -> None:
     """Apply one global delay between geolocation API request starts."""
     global _GEO_NEXT_REQUEST_TIME
@@ -882,19 +892,6 @@ def _is_non_public_ip(value: str) -> bool:
         or addr.is_link_local
         or addr.is_multicast
     )
-
-
-def _geo_resolve_hostname(host: str) -> str | None:
-    if host in _GEO_DNS_CACHE:
-        return _GEO_DNS_CACHE[host]
-
-    try:
-        ip = socket.gethostbyname(host)
-        _GEO_DNS_CACHE[host] = ip
-        return ip
-    except OSError as exc:
-        log(f"Geolocation DNS resolution failed: {host} | {exc}")
-        return None
 
 
 def _geo_database_reader():
@@ -1029,27 +1026,129 @@ def _geo_get_country(ip: str) -> str | None:
     return country
 
 
-def _geo_ip_for_config(uri: str) -> str | None:
-    """Get the server IP from any protocol supported by the original parser."""
+def _geo_parse_exit_ip(response: requests.Response) -> str:
+    """Extract and validate a globally routable IP from an IP-echo response."""
+    response.raise_for_status()
+
+    # Do not accept a redirect to an unencrypted endpoint for this identity check.
+    if urlparse(response.url).scheme.lower() != "https":
+        raise ValueError(f"IP-check endpoint downgraded to non-HTTPS: {response.url}")
+
+    candidate = ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            candidate = str(payload.get("ip") or "").strip()
+    except (ValueError, json.JSONDecodeError):
+        candidate = ""
+
+    if not candidate:
+        candidate = (response.text or "").strip()
+
+    # IP-echo endpoints should return only an address. Reject HTML, error pages,
+    # private addresses, and any other unexpected response instead of guessing.
+    address = ipaddress.ip_address(candidate)
+    if not address.is_global:
+        raise ValueError(f"IP-check endpoint returned a non-global address: {address}")
+
+    return str(address)
+
+
+def _geo_exit_ip_for_config(uri: str) -> str | None:
+    """Start this config in Xray and discover its actual public exit IP via SOCKS5."""
+    if uri in _GEO_EXIT_IP_CACHE:
+        return _GEO_EXIT_IP_CACHE[uri]
+
     parsed = parse_config(uri)
     if not parsed:
         log(f"Geolocation skipped: could not parse config: {uri[:90]}")
+        _GEO_EXIT_IP_CACHE[uri] = None
         return None
 
-    host = (parsed.get("address") or "").strip().strip("[]")
-    if not host:
+    outbound = build_outbound(parsed)
+    if not outbound:
+        log(f"Geolocation skipped: unsupported/invalid Xray outbound: {uri[:90]}")
+        _GEO_EXIT_IP_CACHE[uri] = None
         return None
 
-    try:
-        ip = str(ipaddress.ip_address(host))
-    except ValueError:
-        # Unlike the sample helper's initial host check, do not classify a
-        # hostname as private merely because it is not itself an IP literal.
-        ip = _geo_resolve_hostname(host)
+    port = free_port()
+    xray_config = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "port": port,
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {"udp": False},
+        }],
+        "outbounds": [outbound],
+    }
 
-    if not ip or _is_non_public_ip(ip):
-        return None
-    return ip
+    exit_ip = None
+    with tempfile.TemporaryDirectory(prefix="xray-geolocation-") as tmp:
+        config_path = Path(tmp) / "geolocation.json"
+        xray_log_path = Path(tmp) / "xray.log"
+        config_path.write_text(json.dumps(xray_config), encoding="utf-8")
+
+        with xray_log_path.open("w", encoding="utf-8") as xray_log:
+            try:
+                proc = subprocess.Popen(
+                    [XRAY_BINARY, "run", "-c", str(config_path)],
+                    stdout=xray_log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except OSError as exc:
+                log(f"Geolocation Xray launch failed for {uri[:90]}: {exc}")
+                _GEO_EXIT_IP_CACHE[uri] = None
+                return None
+
+            try:
+                if not wait_port(port, timeout=5.0):
+                    log(f"Geolocation Xray did not open local SOCKS port for {uri[:90]}")
+                else:
+                    proxy_url = f"socks5h://127.0.0.1:{port}"
+                    proxy_settings = {"http": proxy_url, "https": proxy_url}
+
+                    for endpoint in GEOLOCATION_EXIT_IP_URLS:
+                        try:
+                            _geo_wait_rate()
+                            log(f"Checking actual proxy exit IP through Xray: {endpoint}")
+                            response = _GEO_SESSION.get(
+                                endpoint,
+                                proxies=proxy_settings,
+                                timeout=GEOLOCATION_EXIT_IP_TIMEOUT,
+                                allow_redirects=True,
+                            )
+                            exit_ip = _geo_parse_exit_ip(response)
+                            log(f"Actual proxy exit IP: {exit_ip}")
+                            break
+                        except (requests.RequestException, ValueError, TypeError) as exc:
+                            log(f"Exit-IP check failed via {endpoint}: {exc}")
+            finally:
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass  # It may have exited between poll() and terminate().
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        proc.wait(timeout=2)
+
+        if not exit_ip:
+            try:
+                xray_output = xray_log_path.read_text(encoding="utf-8", errors="replace")[-1200:]
+            except OSError:
+                xray_output = ""
+            if xray_output:
+                log(f"Xray geolocation diagnostics for {uri[:70]}: {xray_output}")
+
+    _GEO_EXIT_IP_CACHE[uri] = exit_ip
+    return exit_ip
 
 
 def _geo_country_flag(country: str) -> str:
@@ -1077,7 +1176,9 @@ def _geo_save_config_set(configs: list[str], output_path: Path, label: str) -> i
 
     with output_path.open("w", encoding="utf-8", newline="\n") as out:
         for uri in configs:
-            ip = _geo_ip_for_config(uri)
+            # Geolocate the actual egress IP observed through this config's
+            # Xray SOCKS5 tunnel, never the config's server/domain IP.
+            ip = _geo_exit_ip_for_config(uri)
             if not ip:
                 unresolved_count += 1
                 continue
@@ -1137,6 +1238,9 @@ def run_geolocation(
         return
 
     GEOLOCATION_DIR.mkdir(parents=True, exist_ok=True)
+    # Exit IPs may change between scheduled cycles. Keep the cache only across
+    # the three overlapping result-set passes of this one cycle.
+    _GEO_EXIT_IP_CACHE.clear()
     log("Starting post-check geolocation sorting...")
     log(
         "Geolocation order: "
