@@ -442,22 +442,20 @@ def is_gemini_blocked(body: str) -> bool:
     return _normalize_for_match(GEMINI_BLOCKED_MARKER) in _normalize_for_match(body)
 
 
-def test_one(p: dict) -> tuple[bool, bool]:
-    """Return (works, gemini_compatible).
+def test_one(p: dict) -> tuple[bool, bool, str]:
+    """Return (works, gemini_compatible, failure_reason).
 
     `works` is the result of the original 3 reachability checks.
-    `gemini_compatible` is only meaningful when `works` is True: we then
-    fetch https://gemini.google.com/ through the same proxy and consider
-    it compatible iff the request succeeds (<400) and the geo-block
-    sentence is NOT present in the body.
+    `gemini_compatible` is only meaningful when `works` is True.
+    `failure_reason` contains verbose diagnostic logs and reason for failure if any.
     """
     outbound = build_outbound(p)
     if not outbound:
-        return (False, False)
+        return (False, False, "Failed to build outbound configuration (invalid or missing address/port).")
 
     port = free_port()
     cfg = {
-        "log": {"loglevel": "none"},
+        "log": {"loglevel": "debug"},
         "inbounds": [{
             "port": port,
             "listen": "127.0.0.1",
@@ -473,12 +471,24 @@ def test_one(p: dict) -> tuple[bool, bool]:
 
         proc = subprocess.Popen(
             [XRAY_BINARY, "run", "-c", str(cfg_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
+        xray_output = []
+
         try:
             if not wait_port(port, 5.0):
-                return (False, False)
+                proc.terminate()
+                try:
+                    stdout, _ = proc.communicate(timeout=2)
+                    if stdout:
+                        xray_output.append(stdout)
+                except Exception:
+                    pass
+                logs_str = "".join(xray_output)
+                return (False, False, f"Xray failed to bind/open port {port} within timeout.\nXray Debug Logs:\n{logs_str}")
+
             proxy_url = f"socks5h://127.0.0.1:{port}"
             proxies = {"http": proxy_url, "https": proxy_url}
 
@@ -486,9 +496,20 @@ def test_one(p: dict) -> tuple[bool, bool]:
                 try:
                     r = requests.get(url, proxies=proxies, timeout=TEST_TIMEOUT, allow_redirects=True)
                     if r.status_code >= 500:
-                        return (False, False)
-                except requests.RequestException:
-                    return (False, False)
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                        return (False, False, f"Test endpoint {url} returned failure status code: {r.status_code}")
+                except requests.RequestException as req_err:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                    try:
+                        out, _ = proc.communicate(timeout=1)
+                        if out:
+                            xray_output.append(out)
+                    except Exception:
+                        pass
+                    logs_str = "".join(xray_output)
+                    return (False, False, f"Request exception connecting to test endpoint {url}: {req_err}.\nXray Debug Logs:\n{logs_str}")
 
             # ---- 3 base checks passed. Now the Gemini compatibility check. ----
             try:
@@ -498,19 +519,22 @@ def test_one(p: dict) -> tuple[bool, bool]:
                     timeout=GEMINI_TIMEOUT,
                     allow_redirects=True,
                 )
-            except requests.RequestException:
-                # Couldn't reach Gemini through this proxy -> not usable there.
-                return (True, False)
+            except requests.RequestException as gemini_err:
+                return (True, False, f"Passed base checks, but Gemini request exception: {gemini_err}")
 
             if g.status_code >= 400:
-                # 403/429/etc. — treat as not usable for Gemini.
-                return (True, False)
+                return (True, False, f"Passed base checks, but Gemini responded with status code: {g.status_code}")
 
-            return (True, not is_gemini_blocked(g.text or ""))
+            if is_gemini_blocked(g.text or ""):
+                return (True, False, "Passed base checks, but Gemini returned geo-block restriction marker.")
+
+            return (True, True, "Success: Passed all endpoints and Gemini compatibility check.")
         finally:
             proc.terminate()
             try:
-                proc.wait(timeout=3)
+                stdout, _ = proc.communicate(timeout=3)
+                if stdout:
+                    xray_output.append(stdout)
             except subprocess.TimeoutExpired:
                 proc.kill()
 
@@ -560,6 +584,19 @@ def save_failed_log(failures: list[tuple[str, str]]) -> Path | None:
     with log_file.open("w", encoding="utf-8", newline="\n") as f:
         for i, (url, err) in enumerate(failures, 1):
             f.write(f"[{i}] {url}\nERROR: {err}\n{'-' * 80}\n")
+    return log_file
+
+
+def save_detailed_failures_log(failures: list[tuple[str, dict, str]]) -> Path | None:
+    if not failures:
+        return None
+    log_file = LOG_DIR / f"{ts_now()}_detailed_failures.txt"
+    with log_file.open("w", encoding="utf-8", newline="\n") as f:
+        for i, (uri, p, reason) in enumerate(failures, 1):
+            f.write(f"[{i}] URI: {uri}\n")
+            f.write(f"Parsed Config: {json.dumps(p, indent=2)}\n")
+            f.write(f"Detailed Failure Reason / Xray Debug Output:\n{reason}\n")
+            f.write(f"{'-' * 80}\n")
     return log_file
 
 
@@ -666,10 +703,11 @@ def run_once(use_last_fetch: bool = False) -> None:
         save_failed_log(failures)
         return
 
-    log(f"Testing {len(testable)} configs (workers={TEST_WORKERS})...")
+    log(f"Testing {len(testable)} configs with verbose diagnostics (workers={TEST_WORKERS})...")
 
     working: list[str] = []
     gemini_working: list[str] = []
+    detailed_failures: list[tuple[str, dict, str]] = []
 
     def record_working(uri: str) -> None:
         working.append(uri)
@@ -687,13 +725,13 @@ def run_once(use_last_fetch: bool = False) -> None:
     start = time.time()
 
     with ThreadPoolExecutor(max_workers=TEST_WORKERS) as ex:
-        futures = {ex.submit(test_one, p): uri for uri, p in testable}
+        futures = {ex.submit(test_one, p): (uri, p) for uri, p in testable}
         done = 0
         for fut in as_completed(futures):
             done += 1
-            uri = futures[fut]
+            uri, p = futures[fut]
             try:
-                works, gemini_ok = fut.result()
+                works, gemini_ok, fail_reason = fut.result()
                 if works:
                     record_working(uri)
                     passed += 1
@@ -702,8 +740,10 @@ def run_once(use_last_fetch: bool = False) -> None:
                         gemini_pass += 1
                 else:
                     failed += 1
+                    detailed_failures.append((uri, p, fail_reason))
             except Exception as e:
                 failed += 1
+                detailed_failures.append((uri, p, f"Unhandled exception during test execution: {e}"))
                 if IS_TTY:
                     sys.stdout.write("\n")
                 log(f"  ERR testing {uri[:70]}: {e}")
@@ -722,6 +762,10 @@ def run_once(use_last_fetch: bool = False) -> None:
     log(f"Saved: {working_b64}")
     log(f"Saved: {gemini_txt}  ({len(gemini_working)} configs)")
     log(f"Saved: {gemini_b64}")
+
+    detailed_log_path = save_detailed_failures_log(detailed_failures)
+    if detailed_log_path:
+        log(f"Saved detailed failure diagnostics log: {detailed_log_path}")
 
     failed_log = save_failed_log(failures)
     if failed_log:
