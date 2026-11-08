@@ -1,6 +1,7 @@
 import argparse
 import base64
 import json
+import ipaddress
 import os
 import re
 import socket
@@ -80,6 +81,39 @@ REDDIT_BLOCKED_MARKERS = (
     "blocked by network security",
     "if you think you've been blocked by mistake",
 )
+
+
+# ---- Optional post-check geolocation sorting ----
+# Master switch: leave False to preserve the original run and output behavior.
+ENABLE_GEOLOCATION = True
+
+# These switches choose which already-tested result sets are geolocated.
+# They are consulted only when ENABLE_GEOLOCATION is True.
+GEOLOCATION_CHECK_WORKING = False
+GEOLOCATION_CHECK_GEMINI = False
+GEOLOCATION_CHECK_GEMINI_REDDIT = True
+
+GEOLOCATION_DIR = Path("./geolocation")
+GEOLOCATION_DATABASE_FILE = Path("./databases/dbip-country-lite.mmdb")
+GEOLOCATION_REQUEST_DELAY = 1.5
+GEOLOCATION_MAX_API_ERRORS = 3
+GEOLOCATION_API_SERVICES = [
+    "ipwho.is",
+    "ipapi.co",
+    "ip-api.com",
+    "ip.guide",
+    "ip.sb",
+]
+
+# Geolocation runs sequentially after the Xray worker pool has finished.
+_GEO_SESSION = requests.Session()
+_GEO_NEXT_REQUEST_TIME = 0.0
+_GEO_API_INDEX = 0
+_GEO_DNS_CACHE: dict[str, str] = {}
+_GEO_COUNTRY_CACHE: dict[str, str | None] = {}
+_GEO_API_ERROR_COUNTER: dict[str, int] = {}
+_GEO_DB_READER = None
+_GEO_DB_INIT_ATTEMPTED = False
 
 _REDDIT_SEMAPHORE = threading.BoundedSemaphore(REDDIT_MAX_CONCURRENT)
 _REDDIT_RATE_LOCK = threading.Lock()
@@ -821,6 +855,312 @@ def _write_b64(path: Path, uris: list[str]) -> None:
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------- geolocation
+# This stage operates only on the result lists produced by the original checks.
+# It does not start Xray again and does not modify the original archive files.
+def _geo_wait_rate() -> None:
+    """Apply one global delay between geolocation API request starts."""
+    global _GEO_NEXT_REQUEST_TIME
+
+    now = time.monotonic()
+    if now < _GEO_NEXT_REQUEST_TIME:
+        time.sleep(_GEO_NEXT_REQUEST_TIME - now)
+    _GEO_NEXT_REQUEST_TIME = time.monotonic() + GEOLOCATION_REQUEST_DELAY
+
+
+def _is_non_public_ip(value: str) -> bool:
+    """Check an actual IP address; hostnames are not incorrectly rejected."""
+    try:
+        addr = ipaddress.ip_address(value)
+    except (ValueError, TypeError):
+        return False
+
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_reserved
+        or addr.is_link_local
+        or addr.is_multicast
+    )
+
+
+def _geo_resolve_hostname(host: str) -> str | None:
+    if host in _GEO_DNS_CACHE:
+        return _GEO_DNS_CACHE[host]
+
+    try:
+        ip = socket.gethostbyname(host)
+        _GEO_DNS_CACHE[host] = ip
+        return ip
+    except OSError as exc:
+        log(f"Geolocation DNS resolution failed: {host} | {exc}")
+        return None
+
+
+def _geo_database_reader():
+    """Open the local DB-IP database lazily and reuse its reader for this run."""
+    global _GEO_DB_READER, _GEO_DB_INIT_ATTEMPTED
+
+    if _GEO_DB_INIT_ATTEMPTED:
+        return _GEO_DB_READER
+
+    _GEO_DB_INIT_ATTEMPTED = True
+
+    if not GEOLOCATION_DATABASE_FILE.is_file():
+        log(
+            f"Geolocation database not found: {GEOLOCATION_DATABASE_FILE}; "
+            "will use the API services instead."
+        )
+        return None
+
+    try:
+        import maxminddb
+
+        _GEO_DB_READER = maxminddb.open_database(str(GEOLOCATION_DATABASE_FILE))
+    except ImportError:
+        log("maxminddb is not installed; geolocation will use API services instead.")
+    except Exception as exc:
+        log(f"FAILED opening DB-IP database: {exc}; using API services instead.")
+
+    return _GEO_DB_READER
+
+
+def _geo_lookup_local_database(ip: str) -> str | None:
+    reader = _geo_database_reader()
+    if reader is None:
+        return None
+
+    try:
+        result = reader.get(ip)
+        if not result:
+            return None
+
+        country = result.get("country", {}).get("iso_code")
+        if isinstance(country, str) and len(country) == 2:
+            return country.upper()
+    except Exception as exc:
+        log(f"Geolocation database lookup failed for {ip}: {exc}")
+
+    return None
+
+
+def _geo_query_api(service: str, ip: str) -> str | None:
+    """Query one provider and extract its two-letter ISO country code."""
+    if service == "ipwho.is":
+        response = _GEO_SESSION.get(f"https://ipwho.is/{ip}", timeout=10)
+        country_field = "country_code"
+    elif service == "ipapi.co":
+        response = _GEO_SESSION.get(f"https://ipapi.co/{ip}/json/", timeout=10)
+        country_field = "country"
+    elif service == "ip-api.com":
+        response = _GEO_SESSION.get(f"http://ip-api.com/json/{ip}", timeout=10)
+        country_field = "countryCode"
+    elif service == "ip.guide":
+        response = _GEO_SESSION.get(f"https://ip.guide/{ip}", timeout=10)
+        country_field = "location.country_code"
+    elif service == "ip.sb":
+        response = _GEO_SESSION.get(f"https://api.ip.sb/geoip/{ip}", timeout=10)
+        country_field = "country_code"
+    else:
+        raise ValueError(f"Unknown geolocation API service: {service}")
+
+    response.raise_for_status()
+    data = response.json()
+
+    if country_field == "location.country_code":
+        country = data.get("location", {}).get("country_code")
+    else:
+        country = data.get(country_field)
+
+    if isinstance(country, str) and len(country.strip()) == 2:
+        return country.strip().upper()
+    return None
+
+
+def _geo_api_lookup(ip: str) -> str | None:
+    """Rotate through the providers until one succeeds or a full cycle ends."""
+    global _GEO_API_INDEX
+
+    if _GEO_API_ERROR_COUNTER.get(ip, 0) >= GEOLOCATION_MAX_API_ERRORS:
+        log(f"Skipping geolocation API lookup for {ip}: error limit reached")
+        return None
+
+    start_index = _GEO_API_INDEX
+    while True:
+        service = GEOLOCATION_API_SERVICES[_GEO_API_INDEX]
+        _GEO_API_INDEX = (_GEO_API_INDEX + 1) % len(GEOLOCATION_API_SERVICES)
+
+        try:
+            _geo_wait_rate()
+            log(f"Geolocation API: {service} -> {ip}")
+            country = _geo_query_api(service, ip)
+            if country:
+                return country
+            raise ValueError("No country returned")
+        except Exception as exc:
+            log(f"Geolocation API failed ({service}) for {ip}: {exc}")
+            _GEO_API_ERROR_COUNTER[ip] = _GEO_API_ERROR_COUNTER.get(ip, 0) + 1
+            # Match the supplied script: finish one complete provider rotation;
+            # the per-IP error threshold prevents another lookup later.
+            if _GEO_API_INDEX == start_index:
+                return None
+
+    return None
+
+
+def _geo_get_country(ip: str) -> str | None:
+    if ip in _GEO_COUNTRY_CACHE:
+        return _GEO_COUNTRY_CACHE[ip]
+
+    if _is_non_public_ip(ip):
+        _GEO_COUNTRY_CACHE[ip] = None
+        return None
+
+    log(f"Geolocation local database lookup: {ip}")
+    country = _geo_lookup_local_database(ip)
+
+    if country:
+        _GEO_COUNTRY_CACHE[ip] = country
+        return country
+
+    log(f"Local geolocation lookup unavailable for {ip}; trying APIs")
+    country = _geo_api_lookup(ip)
+    _GEO_COUNTRY_CACHE[ip] = country
+    return country
+
+
+def _geo_ip_for_config(uri: str) -> str | None:
+    """Get the server IP from any protocol supported by the original parser."""
+    parsed = parse_config(uri)
+    if not parsed:
+        log(f"Geolocation skipped: could not parse config: {uri[:90]}")
+        return None
+
+    host = (parsed.get("address") or "").strip().strip("[]")
+    if not host:
+        return None
+
+    try:
+        ip = str(ipaddress.ip_address(host))
+    except ValueError:
+        # Unlike the sample helper's initial host check, do not classify a
+        # hostname as private merely because it is not itself an IP literal.
+        ip = _geo_resolve_hostname(host)
+
+    if not ip or _is_non_public_ip(ip):
+        return None
+    return ip
+
+
+def _geo_country_flag(country: str) -> str:
+    return "".join(chr(ord(char) + 127397) for char in country.upper())
+
+
+def _geo_replace_remark(uri: str, remark: str) -> str:
+    """Replace the existing name while retaining the original config details."""
+    if uri.startswith("vmess://"):
+        encoded = uri[len("vmess://"):].split("#", 1)[0]
+        data = json.loads(b64decode_lenient(encoded).decode("utf-8", errors="replace"))
+        data["ps"] = remark
+        encoded = base64.b64encode(
+            json.dumps(data, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        return "vmess://" + encoded
+
+    return uri.split("#", 1)[0] + "#" + remark
+
+
+def _geo_save_config_set(configs: list[str], output_path: Path, label: str) -> int:
+    """Geolocate one tested result set and save only configs with a country."""
+    output_count = 0
+    unresolved_count = 0
+
+    with output_path.open("w", encoding="utf-8", newline="\n") as out:
+        for uri in configs:
+            ip = _geo_ip_for_config(uri)
+            if not ip:
+                unresolved_count += 1
+                continue
+
+            country = _geo_get_country(ip)
+            if not country:
+                unresolved_count += 1
+                continue
+
+            next_count = output_count + 1
+            remark = (
+                f"{_geo_country_flag(country)}"
+                f"{country}_{next_count}_@Surfboardv2ray"
+            )
+
+            try:
+                converted = _geo_replace_remark(uri, remark)
+            except Exception as exc:
+                unresolved_count += 1
+                log(f"Geolocation remark update failed for {uri[:90]}: {exc}")
+                continue
+
+            out.write(converted + "\n")
+            output_count = next_count
+
+    log(
+        f"Geolocation {label}: saved {output_count} configs to {output_path} "
+        f"({unresolved_count} skipped: private/unresolved/no country/error)"
+    )
+    return output_count
+
+
+def run_geolocation(
+    stamp: str,
+    working_configs: list[str],
+    gemini_configs: list[str],
+    gemini_reddit_configs: list[str],
+) -> None:
+    """Run selected geolocation passes in the requested order."""
+    if not ENABLE_GEOLOCATION:
+        return
+
+    selected_sets: list[tuple[str, str, list[str]]] = []
+    if GEOLOCATION_CHECK_GEMINI_REDDIT:
+        selected_sets.append((
+            "gemini_reddit",
+            "Gemini + Reddit",
+            gemini_reddit_configs,
+        ))
+    if GEOLOCATION_CHECK_GEMINI:
+        selected_sets.append(("gemini", "Gemini", gemini_configs))
+    if GEOLOCATION_CHECK_WORKING:
+        selected_sets.append(("", "Working", working_configs))
+
+    if not selected_sets:
+        log("Geolocation is enabled, but all geolocation result-set switches are off.")
+        return
+
+    GEOLOCATION_DIR.mkdir(parents=True, exist_ok=True)
+    log("Starting post-check geolocation sorting...")
+    log(
+        "Geolocation order: "
+        + " -> ".join(label for _, label, _ in selected_sets)
+    )
+
+    try:
+        for suffix, label, configs in selected_sets:
+            if suffix:
+                output_path = GEOLOCATION_DIR / f"{stamp}_{suffix}_geolocation.txt"
+            else:
+                output_path = GEOLOCATION_DIR / f"{stamp}_geolocation.txt"
+            _geo_save_config_set(configs, output_path, label)
+    finally:
+        global _GEO_DB_READER, _GEO_DB_INIT_ATTEMPTED
+        if _GEO_DB_READER is not None:
+            try:
+                _GEO_DB_READER.close()
+            except Exception as exc:
+                log(f"Could not close geolocation database reader: {exc}")
+        _GEO_DB_READER = None
+        _GEO_DB_INIT_ATTEMPTED = False
+
+
 # ---------------------------------------------------------------- cycle
 def run_once(use_last_fetch: bool = False) -> None:
     ensure_dirs()
@@ -1060,6 +1400,15 @@ def run_once(use_last_fetch: bool = False) -> None:
     failed_log = save_failed_log(failures)
     if failed_log:
         log(f"Saved failure log: {failed_log}")
+
+    # Geolocation is deliberately last: it consumes only the configs that
+    # have completed the original Working/Gemini/Reddit checks.
+    run_geolocation(
+        stamp,
+        working,
+        gemini_working,
+        gemini_reddit_working,
+    )
 
     log("Fetch cycle finished.\n")
 
