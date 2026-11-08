@@ -7,9 +7,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -46,12 +48,42 @@ GEMINI_TIMEOUT = 5
 GEMINI_BLOCKED_MARKER = "Gemini isn't currently supported in your country. Stay tuned!"
 
 REDDIT_TEST_URL = "https://www.reddit.com/"
-REDDIT_TIMEOUT = 5
+# Separate connect/read limits: Reddit can respond more slowly than the simple
+# connectivity endpoints. No automatic retry is used, to avoid amplifying blocks.
+REDDIT_TIMEOUT = (5, 8)
+REDDIT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+# Avoid producing a burst of Reddit requests while the main Xray tests use
+# multiple workers. These limits affect only the Reddit check.
+REDDIT_MAX_CONCURRENT = 3
+REDDIT_MIN_INTERVAL_SECONDS = 0.5
+REDDIT_BODY_PREVIEW_CHARS = 350
 REDDIT_BLOCKED_MARKERS = (
-    "You've been blocked by network security.",
-    "use your developer token",
-    "If you think you've been blocked by mistake",
+    "you've been blocked by network security",
+    "you have been blocked by network security",
+    "blocked by network security",
+    "if you think you've been blocked by mistake",
 )
+
+_REDDIT_SEMAPHORE = threading.BoundedSemaphore(REDDIT_MAX_CONCURRENT)
+_REDDIT_RATE_LOCK = threading.Lock()
+_REDDIT_LAST_REQUEST_START = 0.0
 
 CONFIG_RE = re.compile(
     r"(?:vmess|vless|trojan|ssr|ss|hysteria2|hysteria|hy2|tuic|wireguard|wg)://[^\s\"'<>`]+",
@@ -450,14 +482,144 @@ def is_gemini_blocked(body: str) -> bool:
     return _normalize_for_match(GEMINI_BLOCKED_MARKER) in _normalize_for_match(body)
 
 
+def find_reddit_block_marker(body: str) -> str | None:
+    """Return the known Reddit security-block phrase found in a response."""
+    normalized = _normalize_for_match(unescape(body or ""))
+    for marker in REDDIT_BLOCKED_MARKERS:
+        normalized_marker = _normalize_for_match(marker)
+        if normalized_marker in normalized:
+            return marker
+    return None
+
+
 def is_reddit_blocked(body: str) -> bool:
-    """True when Reddit displays its network-security block message."""
-    normalized = _normalize_for_match(body)
-    return any(_normalize_for_match(marker) in normalized for marker in REDDIT_BLOCKED_MARKERS)
+    """True only for a response containing a recognized Reddit block marker."""
+    return find_reddit_block_marker(body) is not None
 
 
-def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
-    """Return (works, gemini_ok, reddit_ok, gemini_status, reddit_status).
+def _reddit_rate_limit() -> None:
+    """Space request starts globally across worker threads."""
+    global _REDDIT_LAST_REQUEST_START
+    with _REDDIT_RATE_LOCK:
+        now = time.monotonic()
+        delay = REDDIT_MIN_INTERVAL_SECONDS - (now - _REDDIT_LAST_REQUEST_START)
+        if delay > 0:
+            time.sleep(delay)
+        _REDDIT_LAST_REQUEST_START = time.monotonic()
+
+
+def _response_excerpt(body: str, marker: str | None = None) -> str:
+    """Return a short, single-line diagnostic excerpt without dumping HTML."""
+    text = re.sub(r"\s+", " ", unescape(body or "")).strip()
+    if not text:
+        return "<empty response body>"
+    if marker:
+        lower_text = _normalize_for_match(text)
+        lower_marker = _normalize_for_match(marker)
+        pos = lower_text.find(lower_marker)
+        if pos >= 0:
+            start = max(0, pos - 100)
+            end = min(len(text), pos + len(marker) + 180)
+            return text[start:end][:REDDIT_BODY_PREVIEW_CHARS]
+    return text[:REDDIT_BODY_PREVIEW_CHARS]
+
+
+def classify_reddit_response(response: requests.Response) -> tuple[bool, str, str, str]:
+    """Return (allowed, status, details, category) for an HTTP response.
+
+    A generic HTTP 403 is deliberately NOT called a confirmed network-security
+    block unless the response body contains one of Reddit's known block markers.
+    """
+    body = response.text or ""
+    marker = find_reddit_block_marker(body)
+    status_code = response.status_code
+    content_type = response.headers.get("Content-Type", "unknown")
+    final_url = response.url
+    elapsed = getattr(getattr(response, "elapsed", None), "total_seconds", lambda: 0.0)()
+    body_bytes = len(response.content or b"")
+
+    history = getattr(response, "history", []) or []
+    redirect_chain = " -> ".join([item.url for item in history] + [final_url])
+    detail_parts = [
+        f"HTTP {status_code}",
+        f"redirect_chain={redirect_chain}",
+        f"final_url={final_url}",
+        f"content_type={content_type}",
+        f"elapsed={elapsed:.2f}s",
+        f"body_bytes={body_bytes}",
+    ]
+    for header in ("Server", "Retry-After", "X-Ratelimit-Used", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "X-Reddit-Request-Id"):
+        value = response.headers.get(header)
+        if value:
+            detail_parts.append(f"{header}={value}")
+    if marker:
+        detail_parts.append(f"matched_marker={marker!r}")
+    detail_parts.append(f"body_excerpt={_response_excerpt(body, marker)!r}")
+    details = " | ".join(detail_parts)
+
+    if marker:
+        return False, f"Confirmed network-security block (HTTP {status_code})", details, "security_block"
+    if status_code == 429:
+        return False, "Rate limited (HTTP 429; no known security marker)", details, "rate_limited"
+    if status_code == 403:
+        return False, "HTTP 403 (no recognized Reddit security marker)", details, "unclassified_403"
+    if status_code == 401:
+        return False, "Authentication required (HTTP 401)", details, "login_required"
+    if status_code >= 500:
+        return False, f"Reddit server error (HTTP {status_code})", details, "http_error"
+    if status_code >= 400:
+        return False, f"HTTP error {status_code}", details, "http_error"
+    if 200 <= status_code < 300:
+        if not body.strip():
+            return False, f"Empty response body (HTTP {status_code})", details, "other"
+        final_path = urlparse(final_url).path.lower().rstrip("/")
+        if final_path.startswith(("/login", "/account/login", "/register")):
+            return False, f"Login page returned (HTTP {status_code})", details, "login_required"
+        normalized_content_type = content_type.lower()
+        if normalized_content_type != "unknown" and not any(
+            kind in normalized_content_type for kind in ("text/html", "application/xhtml+xml")
+        ):
+            return False, f"Unexpected content type ({content_type})", details, "other"
+        return True, f"Allowed (HTTP {status_code})", details, "allowed"
+    if 300 <= status_code < 400:
+        return False, f"Unresolved redirect (HTTP {status_code})", details, "other"
+    return False, f"Unexpected HTTP status {status_code}", details, "other"
+
+
+def reddit_request(proxies: dict | None = None) -> tuple[bool, str, str, str]:
+    """Make one paced Reddit homepage request through the supplied proxy."""
+    with _REDDIT_SEMAPHORE:
+        _reddit_rate_limit()
+        response = requests.get(
+            REDDIT_TEST_URL,
+            headers=REDDIT_HEADERS,
+            proxies=proxies,
+            timeout=REDDIT_TIMEOUT,
+            allow_redirects=True,
+        )
+    return classify_reddit_response(response)
+
+
+def reddit_direct_control() -> tuple[str, str]:
+    """Probe Reddit once directly (not through Xray) as a runner/network control."""
+    try:
+        # Disable environment proxies so this is a genuine direct-runner control.
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(
+                REDDIT_TEST_URL,
+                headers=REDDIT_HEADERS,
+                timeout=REDDIT_TIMEOUT,
+                allow_redirects=True,
+            )
+        _, status, details, _ = classify_reddit_response(response)
+        return status, details
+    except requests.RequestException as exc:
+        return f"Unreachable: {type(exc).__name__}: {exc}", f"direct_runner_exception={exc!r}"
+
+
+def test_one(p: dict) -> tuple[bool, bool, bool, str, str, str, str]:
+    """Return (works, gemini_ok, reddit_ok, gemini_status, reddit_status, reddit_details, reddit_category).
 
     `works` is the result of the original 3 reachability checks.
     Site compatibility checks run independently after those checks pass.
@@ -465,7 +627,7 @@ def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
     outbound = build_outbound(p)
     if not outbound:
         return (False, False, False,
-                "Failed to build outbound configuration (invalid or missing address/port).", "")
+                "Failed to build outbound configuration (invalid or missing address/port).", "", "", "")
 
     port = free_port()
     cfg = {
@@ -502,7 +664,7 @@ def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
                     pass
                 logs_str = "".join(xray_output)
                 return (False, False, False,
-                        f"Xray failed to bind/open port {port} within timeout.\nXray Debug Logs:\n{logs_str}", "")
+                        f"Xray failed to bind/open port {port} within timeout.\nXray Debug Logs:\n{logs_str}", "", "", "")
 
             proxy_url = f"socks5h://127.0.0.1:{port}"
             proxies = {"http": proxy_url, "https": proxy_url}
@@ -514,7 +676,7 @@ def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
                         proc.terminate()
                         proc.wait(timeout=2)
                         return (False, False, False,
-                                f"Test endpoint {url} returned failure status code: {r.status_code}", "")
+                                f"Test endpoint {url} returned failure status code: {r.status_code}", "", "", "")
                 except requests.RequestException as req_err:
                     proc.terminate()
                     proc.wait(timeout=2)
@@ -526,7 +688,7 @@ def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
                         pass
                     logs_str = "".join(xray_output)
                     return (False, False, False,
-                            f"Request exception connecting to test endpoint {url}: {req_err}.\nXray Debug Logs:\n{logs_str}", "")
+                            f"Request exception connecting to test endpoint {url}: {req_err}.\nXray Debug Logs:\n{logs_str}", "", "", "")
 
             # ---- Base checks passed. Check Gemini and Reddit independently. ----
             gemini_ok = False
@@ -549,27 +711,17 @@ def test_one(p: dict) -> tuple[bool, bool, bool, str, str]:
             except requests.RequestException as gemini_err:
                 gemini_status = f"Unreachable: {gemini_err}"
 
+            reddit_details = ""
+            reddit_category = "other"
             try:
-                r = requests.get(
-                    REDDIT_TEST_URL,
-                    headers=HEADERS,
-                    proxies=proxies,
-                    timeout=REDDIT_TIMEOUT,
-                    allow_redirects=True,
-                )
-                if is_reddit_blocked(r.text or ""):
-                    reddit_status = "Blocked by Reddit network security"
-                elif r.status_code in (403, 429):
-                    reddit_status = f"Blocked/rate-limited (HTTP {r.status_code})"
-                elif r.status_code >= 400:
-                    reddit_status = f"HTTP {r.status_code}"
-                else:
-                    reddit_ok = True
-                    reddit_status = "Allowed"
+                reddit_ok, reddit_status, reddit_details, reddit_category = reddit_request(proxies)
             except requests.RequestException as reddit_err:
-                reddit_status = f"Unreachable: {reddit_err}"
+                reddit_status = f"Unreachable: {type(reddit_err).__name__}: {reddit_err}"
+                reddit_details = f"request_exception={reddit_err!r}"
+                reddit_category = "unreachable"
 
-            return (True, gemini_ok, reddit_ok, gemini_status, reddit_status)
+            return (True, gemini_ok, reddit_ok, gemini_status,
+                    reddit_status, reddit_details, reddit_category)
         finally:
             proc.terminate()
             try:
@@ -774,7 +926,7 @@ def run_once(use_last_fetch: bool = False) -> None:
     gemini_reddit_working: list[str] = []
     detailed_failures: list[tuple[str, dict, str]] = []
     # Keep per-config site-check outcomes so a zero Reddit pass count is diagnosable.
-    site_check_results: list[tuple[str, str, str]] = []
+    site_check_results: list[tuple[str, str, str, str]] = []
 
     def record_working(uri: str) -> None:
         working.append(uri)
@@ -795,12 +947,20 @@ def run_once(use_last_fetch: bool = False) -> None:
     gemini_pass = 0
     reddit_pass = 0
     reddit_attempted = 0
-    reddit_blocked = 0
-    reddit_unreachable = 0
+    reddit_security_blocks = 0
+    reddit_rate_limited = 0
+    reddit_unclassified_403 = 0
+    reddit_login_required = 0
     reddit_http_errors = 0
+    reddit_unreachable = 0
     reddit_other_fail = 0
     gemini_reddit_pass = 0
     start = time.time()
+    direct_reddit_status, direct_reddit_details = reddit_direct_control()
+    log(f"Direct runner Reddit control (NOT through Xray): {direct_reddit_status}")
+    log(f"Reddit check pacing: max concurrent={REDDIT_MAX_CONCURRENT}, "
+        f"minimum interval={REDDIT_MIN_INTERVAL_SECONDS:.2f}s, "
+        f"timeout connect/read={REDDIT_TIMEOUT[0]}/{REDDIT_TIMEOUT[1]}s")
 
     with ThreadPoolExecutor(max_workers=TEST_WORKERS) as ex:
         futures = {ex.submit(test_one, p): (uri, p) for uri, p in testable}
@@ -809,25 +969,32 @@ def run_once(use_last_fetch: bool = False) -> None:
             done += 1
             uri, p = futures[fut]
             try:
-                works, gemini_ok, reddit_ok, gemini_status, reddit_status = fut.result()
+                (works, gemini_ok, reddit_ok, gemini_status, reddit_status,
+                 reddit_details, reddit_category) = fut.result()
                 if works:
                     record_working(uri)
                     passed += 1
                     # Reddit is checked independently for every config that passes
                     # the three base connectivity endpoints.
                     reddit_attempted += 1
-                    site_check_results.append((uri, gemini_status, reddit_status))
+                    site_check_results.append((uri, gemini_status, reddit_status, reddit_details))
                     if gemini_ok:
                         record_gemini(uri)
                         gemini_pass += 1
                     if reddit_ok:
                         reddit_pass += 1
-                    elif reddit_status.startswith("Blocked"):
-                        reddit_blocked += 1
-                    elif reddit_status.startswith("Unreachable"):
-                        reddit_unreachable += 1
-                    elif reddit_status.startswith("HTTP "):
+                    elif reddit_category == "security_block":
+                        reddit_security_blocks += 1
+                    elif reddit_category == "rate_limited":
+                        reddit_rate_limited += 1
+                    elif reddit_category == "unclassified_403":
+                        reddit_unclassified_403 += 1
+                    elif reddit_category == "login_required":
+                        reddit_login_required += 1
+                    elif reddit_category == "http_error":
                         reddit_http_errors += 1
+                    elif reddit_category == "unreachable":
+                        reddit_unreachable += 1
                     else:
                         reddit_other_fail += 1
                     if gemini_ok and reddit_ok:
@@ -857,21 +1024,29 @@ def run_once(use_last_fetch: bool = False) -> None:
         f"Gemini-blocked/unreachable: {passed - gemini_pass}")
     log(f"Reddit checks attempted: {reddit_attempted}")
     log(f"Reddit-accessible: {reddit_pass}  "
-        f"Reddit network-security/rate-limit blocks: {reddit_blocked}  "
-        f"Unreachable: {reddit_unreachable}  HTTP errors: {reddit_http_errors}  "
-        f"Other errors: {reddit_other_fail}")
+        f"Confirmed network-security blocks: {reddit_security_blocks}  "
+        f"Rate limited (HTTP 429): {reddit_rate_limited}  "
+        f"Unclassified HTTP 403: {reddit_unclassified_403}  "
+        f"Login required: {reddit_login_required}  "
+        f"Other HTTP errors: {reddit_http_errors}  "
+        f"Unreachable: {reddit_unreachable}  Other: {reddit_other_fail}")
     log(f"Gemini + Reddit compatible: {gemini_reddit_pass}")
 
-    # Save exact per-config outcomes, including request exceptions and HTTP codes.
-    if site_check_results:
-        site_check_log = LOG_DIR / f"{stamp}_gemini_reddit_checks.txt"
-        with site_check_log.open("w", encoding="utf-8", newline="\n") as f:
-            for i, (uri, gemini_status, reddit_status) in enumerate(site_check_results, 1):
-                f.write(f"[{i}] URI: {uri}\n")
-                f.write(f"Gemini: {gemini_status}\n")
-                f.write(f"Reddit: {reddit_status}\n")
-                f.write("-" * 80 + "\n")
-        log(f"Saved per-config Gemini/Reddit diagnostics: {site_check_log}")
+    # Save per-config outcomes and response metadata/body excerpts. A generic
+    # 403 is kept separate from a confirmed Reddit network-security page.
+    site_check_log = LOG_DIR / f"{stamp}_gemini_reddit_checks.txt"
+    with site_check_log.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("DIRECT RUNNER CONTROL (not through Xray)\n")
+        f.write(f"Reddit: {direct_reddit_status}\n")
+        f.write(f"Details: {direct_reddit_details}\n")
+        f.write("=" * 80 + "\n")
+        for i, (uri, gemini_status, reddit_status, reddit_details) in enumerate(site_check_results, 1):
+            f.write(f"[{i}] URI: {uri}\n")
+            f.write(f"Gemini: {gemini_status}\n")
+            f.write(f"Reddit: {reddit_status}\n")
+            f.write(f"Reddit details: {reddit_details}\n")
+            f.write("-" * 80 + "\n")
+    log(f"Saved per-config Gemini/Reddit diagnostics: {site_check_log}")
     log(f"Saved: {working_txt}  ({len(working)} configs)")
     log(f"Saved: {working_b64}")
     log(f"Saved: {gemini_txt}  ({len(gemini_working)} configs)")
