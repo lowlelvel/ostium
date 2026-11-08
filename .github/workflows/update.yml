@@ -1,16 +1,17 @@
 name: Auto Update Proxies
 
 on:
+  # Runs every 6 hours.
   schedule:
-    # Runs every 6 hours (adjust as needed)
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  # Allows manual trigger from the Actions tab.
+  workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-22.04
     permissions:
-      contents: write # Required to commit back changes to the repo
+      contents: write
 
     steps:
       - name: Checkout Repository
@@ -24,39 +25,105 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          python -m pip install requests
 
       - name: Install Xray Core
+        shell: bash
         run: |
-          # Download latest Xray release zip directly via GitHub's permanent redirect URL
-          curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-          
-          # Extract and place binary into /usr/local/bin
-          sudo mkdir -p /tmp/xray
-          sudo unzip xray.zip -d /tmp/xray
-          sudo mv /tmp/xray/xray /usr/local/bin/xray
-          sudo chmod +x /usr/local/bin/xray
-          
-          # Verify installation
+          set -Eeuo pipefail
+
+          # Query GitHub for the latest stable release and its exact asset URL.
+          # This avoids depending on a stale hard-coded /releases/latest/download URL.
+          release_json="$(mktemp)"
+          download_dir="$(mktemp -d)"
+          trap 'rm -f "$release_json"; rm -rf "$download_dir"' EXIT
+
+          release_api="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 20 \
+            "$release_api" \
+            --output "$release_json"
+
+          asset_url="$(jq -er \
+            '[.assets[] | select(.name == "Xray-linux-64.zip")][0].browser_download_url // empty' \
+            "$release_json")"
+
+          asset_digest="$(jq -r \
+            '[.assets[] | select(.name == "Xray-linux-64.zip")][0].digest // ""' \
+            "$release_json")"
+
+          if [[ -z "$asset_url" ]]; then
+            echo "ERROR: Xray-linux-64.zip was not found in the latest release."
+            exit 1
+          fi
+
+          echo "Downloading Xray asset: $asset_url"
+          zip_path="$download_dir/xray.zip"
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 20 \
+            "$asset_url" \
+            --output "$zip_path"
+
+          # Reject empty, unexpectedly small, or invalid downloads before extraction.
+          if [[ ! -s "$zip_path" ]]; then
+            echo "ERROR: Xray download is empty."
+            exit 1
+          fi
+
+          archive_size="$(stat -c '%s' "$zip_path")"
+          if (( archive_size < 1000000 )); then
+            echo "ERROR: Xray download is only ${archive_size} bytes; expected a release archive."
+            exit 1
+          fi
+
+          unzip -tq "$zip_path" >/dev/null
+
+          # Verify against GitHub's published asset digest when it is provided.
+          if [[ "$asset_digest" == sha256:* ]]; then
+            expected_sha256="${asset_digest#sha256:}"
+            printf '%s  %s\n' "$expected_sha256" "$zip_path" | sha256sum --check -
+          fi
+
+          extract_dir="$download_dir/extracted"
+          mkdir -p "$extract_dir"
+          unzip -oq "$zip_path" -d "$extract_dir"
+
+          xray_binary="$(find "$extract_dir" -type f -name xray -print -quit)"
+          if [[ -z "$xray_binary" ]]; then
+            echo "ERROR: The downloaded archive does not contain an xray binary."
+            exit 1
+          fi
+
+          sudo install -m 0755 "$xray_binary" /usr/local/bin/xray
           xray version
 
       - name: Run Script
+        shell: bash
         run: |
-          # Make sure 'script.py' matches your actual Python script filename
+          set -Eeuo pipefail
+          # Make sure 'script.py' matches your actual Python script filename.
           python script.py --once
 
       - name: Commit and Push Results
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Always stage archive updates
-          git add archive_all/
-          
-          # Conditionally stage logs if the directory exists and has files
-          if [ -d "logs" ] && [ "$(ls -A logs)" ]; then
-            git add logs/
+
+          # Stage archive updates when the directory exists.
+          if [[ -d "archive_all" ]]; then
+            git add -A -- archive_all/
           fi
-          
-          # Commit and push only if there are staged changes
-          git diff --cached --quiet || (git commit -m "🤖 Auto-update proxy lists and logs [skip ci]" && git push)
+
+          # Stage logs only when the directory contains at least one file.
+          if [[ -d "logs" ]] && [[ -n "$(find logs -type f -print -quit)" ]]; then
+            git add -A -- logs/
+          fi
+
+          # Commit and push only when there are staged changes.
+          if git diff --cached --quiet; then
+
