@@ -547,6 +547,15 @@ def xray_available() -> bool:
         return False
 
 
+def socks_support_available() -> bool:
+    """Requests needs PySocks to use socks5/socks5h proxy URLs."""
+    try:
+        import socks  # noqa: F401  (provided by the PySocks package)
+        return True
+    except ImportError:
+        return False
+
+
 # ---------------------------------------------------------------- progress
 def render_progress(done: int, total: int, passed: int, failed: int,
                     skipped: int, gemini_pass: int, start: float) -> None:
@@ -697,6 +706,13 @@ def run_once(use_last_fetch: bool = False) -> None:
     working_b64.write_text("", encoding="utf-8")
     gemini_txt.write_text("", encoding="utf-8")
     gemini_b64.write_text("", encoding="utf-8")
+
+    if not socks_support_available():
+        log("ERROR: SOCKS proxy support is missing from this Python environment.")
+        log('       Install it with: python -m pip install "requests[socks]"')
+        log("       In GitHub Actions, install this dependency before running the script.")
+        save_failed_log(failures)
+        return
 
     if not xray_available():
         log("WARNING: xray binary not available; skipping live test.")
