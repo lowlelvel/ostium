@@ -1,17 +1,27 @@
 name: Auto Update Proxies
 
 on:
-  # Runs every 6 hours.
+  # Runs every 6 hours. Scheduled runs save error logs by default.
   schedule:
     - cron: '0 */6 * * *'
-  # Allows manual trigger from the Actions tab.
+
+  # Manual runs expose an ON/OFF checkbox for retaining error logs.
   workflow_dispatch:
+    inputs:
+      save_error_logs:
+        description: 'Save error logs to the repository and as a downloadable artifact'
+        required: true
+        type: boolean
+        default: true
 
 jobs:
   update:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    # Scheduled runs always save logs. Manual runs follow the checkbox above.
+    env:
+      SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs }}
 
     steps:
       - name: Checkout Repository
@@ -122,16 +132,23 @@ jobs:
           # Make sure 'script.py' matches your actual Python script filename.
           "$PYTHON_BIN" script.py --once
 
-      # Upload output files even if the script exits with an error, so any
-      # archives/logs produced before the failure remain available for diagnosis.
-      - name: Upload Results and Logs
+      # Archive outputs are always uploaded, regardless of the error-log toggle.
+      - name: Upload Proxy Archives
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: proxy-results-${{ github.run_number }}
-          path: |
-            archive_all/
-            logs/
+          name: proxy-archives-${{ github.run_number }}
+          path: archive_all/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Error logs are uploaded only when the toggle is ON.
+      - name: Upload Error Logs
+        if: always() && env.SAVE_ERROR_LOGS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-error-logs-${{ github.run_number }}
+          path: logs/
           if-no-files-found: warn
           retention-days: 14
 
@@ -143,20 +160,25 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage archive updates when the directory exists.
+          # Archive updates are always saved to the repository.
           if [[ -d "archive_all" ]]; then
             git add -A -- archive_all/
           fi
 
-          # Stage logs only when the directory contains at least one file.
-          if [[ -d "logs" ]] && [[ -n "$(find logs -type f -print -quit)" ]]; then
-            git add -A -- logs/
+          # Save logs to the repository only when the toggle is ON.
+          if [[ "$SAVE_ERROR_LOGS" == "true" ]]; then
+            if [[ -d "logs" ]] && [[ -n "$(find logs -type f -print -quit)" ]]; then
+              git add -A -- logs/
+            fi
+            echo "Error-log saving is ON."
+          else
+            echo "Error-log saving is OFF. Logs will not be committed or uploaded."
           fi
 
           # Commit and push only when there are staged changes.
           if git diff --cached --quiet; then
             echo "No archive or log changes to commit."
           else
-            git commit -m "🤖 Auto-update proxy lists and logs [skip ci]"
+            git commit -m "🤖 Auto-update proxy lists and optional error logs [skip ci]"
             git push
           fi
