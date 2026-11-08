@@ -1,3 +1,35 @@
+name: Auto Update Proxies
+
+on:
+  # Runs every 6 hours.
+  schedule:
+    - cron: '0 */6 * * *'
+  # Allows manual trigger from the Actions tab.
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ubuntu-22.04 includes system Python 3.10. Use it directly instead
+      # of actions/setup-python, which downloads Python from GitHub Releases
+      # and can fail when that asset endpoint returns HTTP 504.
+      - name: Verify Runner Python
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PYTHON_BIN="$(command -v python3)"
+          "$PYTHON_BIN" - <<'PYTHON_CHECK'
+          import sys
+          if sys.version_info[:2] != (3, 10):
+              raise SystemExit(
+                  f"Expected Python 3.10 on ubuntu-22.04, found {sys.version.split()[0]}"
               )
           print(f"Using runner Python {sys.version.split()[0]}")
           PYTHON_CHECK
@@ -105,4 +137,3 @@
             git commit -m "🤖 Auto-update proxy lists and logs [skip ci]"
             git push
           fi
-
