@@ -27,13 +27,11 @@ jobs:
 
       - name: Install Xray Core
         run: |
-          # Download latest Xray release zip directly
-          XRAY_VERSION=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "Installing Xray version: $XRAY_VERSION"
-          
-          curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+          # Download latest Xray release zip directly via GitHub's permanent redirect URL
+          curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
           
           # Extract and place binary into /usr/local/bin
+          sudo mkdir -p /tmp/xray
           sudo unzip xray.zip -d /tmp/xray
           sudo mv /tmp/xray/xray /usr/local/bin/xray
           sudo chmod +x /usr/local/bin/xray
@@ -43,7 +41,7 @@ jobs:
 
       - name: Run Script
         run: |
-          python ostium.py --once
+          python script.py --once
 
       - name: Commit and Push Results
         uses: stefanzweifel/git-auto-commit-action@v5
