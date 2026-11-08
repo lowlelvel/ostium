@@ -1,3 +1,4 @@
+
 name: Auto Update Proxies
 
 on:
@@ -19,6 +20,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+
     # Manual runs follow the checkbox. Scheduled runs leave error-log retention OFF.
     env:
       SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs }}
@@ -128,8 +130,8 @@ jobs:
       - name: Run Script
         shell: bash
         run: |
-          mkdir -p archive_all logs geolocation
           set -Eeuo pipefail
+          mkdir -p archive_all logs geolocation
           # Make sure 'script.py' matches your actual Python script filename.
           "$PYTHON_BIN" script.py --once
 
@@ -140,6 +142,17 @@ jobs:
         with:
           name: proxy-archives-${{ github.run_number }}
           path: archive_all/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Geolocation results are uploaded independently of the error-log toggle.
+      # Skip this step cleanly when geolocation is disabled or produces no files.
+      - name: Upload Geolocation Results
+        if: always() && hashFiles('geolocation/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-geolocation-${{ github.run_number }}
+          path: geolocation/
           if-no-files-found: warn
           retention-days: 14
 
